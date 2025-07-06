@@ -1,0 +1,777 @@
+"""
+Advanced Slope Stability Analysis Module
+=======================================
+A comprehensive slope stability calculator implementing multiple analysis methods
+with optimized algorithms, robust error handling, and extensive features.
+"""
+
+import numpy as np
+import logging
+from dataclasses import dataclass, replace
+from typing import Tuple, Optional, List, Dict, Union
+from enum import Enum
+from scipy.optimize import differential_evolution, minimize
+from scipy.interpolate import interp1d
+import warnings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class AnalysisMethod(Enum):
+    """Available slope stability analysis methods."""
+    ORDINARY = "Ordinary Method of Slices (Fellenius)"
+    BISHOP = "Bishop's Simplified Method"
+    JANBU = "Janbu's Simplified Method"
+    SPENCER = "Spencer's Method"
+    MORGENSTERN_PRICE = "Morgenstern-Price Method"
+
+
+class FailureMode(Enum):
+    """Types of failure surfaces."""
+    CIRCULAR = "Circular failure surface"
+    NON_CIRCULAR = "Non-circular failure surface"
+    PLANAR = "Planar failure surface"
+    WEDGE = "Wedge failure"
+
+
+@dataclass
+class SoilLayer:
+    """Represents a soil layer with properties."""
+    name: str
+    thickness: float
+    unit_weight: float  # kN/m³
+    cohesion: float  # kPa
+    friction_angle: float  # degrees
+    saturated_unit_weight: Optional[float] = None
+    undrained_strength: Optional[float] = None  # Su for undrained analysis
+    
+    def __post_init__(self):
+        if self.saturated_unit_weight is None:
+            # Issue warning about missing saturated unit weight
+            warnings.warn(
+                f"Saturated unit weight not provided for layer '{self.name}'. "
+                f"Using rough approximation (γ + 9.81). "
+                f"For accurate analysis, provide actual saturated unit weight.",
+                UserWarning
+            )
+            self.saturated_unit_weight = self.unit_weight + 9.81
+            
+
+@dataclass
+class SlopeGeometry:
+    """Defines the slope geometry."""
+    height: float  # meters
+    angle: float  # degrees
+    crest_width: float = 0.0  # Width of flat area at top
+    toe_width: float = 0.0  # Width of flat area at bottom
+    bench_heights: List[float] = None  # Heights for benched slopes
+    bench_widths: List[float] = None  # Widths for benched slopes
+    
+    def __post_init__(self):
+        if self.bench_heights is None:
+            self.bench_heights = []
+        if self.bench_widths is None:
+            self.bench_widths = []
+            
+
+@dataclass
+class LoadCondition:
+    """External loads on the slope."""
+    surcharge: float = 0.0  # kPa, uniform surcharge
+    point_loads: List[Tuple[float, float, float]] = None  # (x, y, magnitude)
+    line_loads: List[Tuple[float, float, float, float]] = None  # (x1, x2, y, magnitude)
+    seismic_kh: float = 0.0  # Horizontal seismic coefficient
+    seismic_kv: float = 0.0  # Vertical seismic coefficient
+    
+    def __post_init__(self):
+        if self.point_loads is None:
+            self.point_loads = []
+        if self.line_loads is None:
+            self.line_loads = []
+
+
+@dataclass
+class WaterCondition:
+    """Groundwater and pore pressure conditions."""
+    phreatic_surface: Optional[List[Tuple[float, float]]] = None  # Points defining water table
+    ru_coefficient: Optional[float] = None  # Pore pressure ratio
+    steady_seepage: bool = False
+    rapid_drawdown: bool = False
+    
+
+@dataclass
+class AnalysisResult:
+    """Results from stability analysis."""
+    factor_of_safety: float
+    critical_center: Tuple[float, float]
+    critical_radius: float
+    method: AnalysisMethod
+    failure_mode: FailureMode
+    slice_data: Optional[Dict] = None
+    convergence_error: Optional[float] = None
+    iterations: Optional[int] = None
+    reliability_index: Optional[float] = None  # For probabilistic analysis
+
+
+class SliceCalculator:
+    """Handles slice calculations for various methods."""
+    
+    def __init__(self, geometry: SlopeGeometry, layers: List[SoilLayer], 
+                 water: WaterCondition, loads: LoadCondition):
+        self.geometry = geometry
+        self.layers = layers
+        self.water = water
+        self.loads = loads
+        self._build_profile()
+        self._initialize_interpolators()
+        
+    def _build_profile(self):
+        """Build the slope profile including benches."""
+        # Create profile points
+        points = [(0, self.geometry.height)]
+        
+        if self.geometry.bench_heights:
+            # Add bench points
+            current_x = 0
+            current_y = self.geometry.height
+            
+            for h, w in zip(self.geometry.bench_heights, self.geometry.bench_widths):
+                # Slope segment
+                x_inc = (current_y - h) / np.tan(np.radians(self.geometry.angle))
+                current_x += x_inc
+                current_y = h
+                points.append((current_x, current_y))
+                
+                # Bench segment
+                current_x += w
+                points.append((current_x, current_y))
+        else:
+            # Simple slope
+            x_end = self.geometry.height / np.tan(np.radians(self.geometry.angle))
+            points.append((x_end, 0))
+            
+        # Add toe width
+        if self.geometry.toe_width > 0:
+            points.append((points[-1][0] + self.geometry.toe_width, 0))
+            
+        self.profile_points = np.array(points)
+        
+    def _initialize_interpolators(self):
+        """Initialize interpolation functions for ground and water surfaces."""
+        # Ground surface interpolator
+        self._surface_interp = interp1d(
+            self.profile_points[:, 0], 
+            self.profile_points[:, 1],
+            kind='linear',
+            bounds_error=False,
+            fill_value=(self.profile_points[0, 1], self.profile_points[-1, 1])
+        )
+        
+        # Water table interpolator
+        if self.water.phreatic_surface is not None:
+            water_points = np.array(self.water.phreatic_surface)
+            self._water_interp = interp1d(
+                water_points[:, 0],
+                water_points[:, 1],
+                kind='linear',
+                bounds_error=False,
+                fill_value=-np.inf
+            )
+        else:
+            self._water_interp = None
+        
+    def get_ground_surface(self, x: float) -> float:
+        """Get ground surface elevation at x coordinate."""
+        return float(self._surface_interp(x))
+    
+    def get_water_level(self, x: float) -> float:
+        """Get water table elevation at x coordinate."""
+        if self._water_interp is None:
+            return -np.inf
+        return float(self._water_interp(x))
+    
+    def get_soil_properties(self, x: float, y: float) -> Tuple[float, float, float]:
+        """Get soil properties at a point."""
+        # Determine which layer the point is in
+        ground_surface = self.get_ground_surface(x)
+        
+        if len(self.layers) == 1:
+            layer = self.layers[0]
+        else:
+            # Multi-layer - find correct layer
+            depth_from_surface = ground_surface - y
+            cumulative_depth = 0
+            
+            for layer in self.layers:
+                cumulative_depth += layer.thickness
+                if depth_from_surface <= cumulative_depth:
+                    break
+            else:
+                layer = self.layers[-1]  # Default to bottom layer
+                
+        # Check if below water table
+        water_level = self.get_water_level(x)
+        if y < water_level:
+            unit_weight = layer.saturated_unit_weight - 9.81  # Effective unit weight
+        else:
+            unit_weight = layer.unit_weight
+            
+        return unit_weight, layer.cohesion, layer.friction_angle
+    
+    def compute_slice_forces(self, x: float, width: float, center: Tuple[float, float], 
+                           radius: float, method: AnalysisMethod) -> Optional[Dict]:
+        """Compute forces on a slice."""
+        try:
+            # Get slice geometry
+            discriminant = radius**2 - (x - center[0])**2
+            if discriminant < 0:
+                return None
+                
+            y_base = center[1] - np.sqrt(discriminant)
+            y_top = self.get_ground_surface(x)
+            
+            if y_base >= y_top:
+                return None
+                
+            # Slice properties
+            height = y_top - y_base
+            alpha = np.arctan2(center[1] - y_base, center[0] - x)
+            
+            # Get average soil properties
+            y_mid = (y_top + y_base) / 2
+            gamma, c, phi = self.get_soil_properties(x, y_mid)
+            phi_rad = np.radians(phi)
+            
+            # Weight calculation
+            weight = gamma * height * width
+            
+            # Add surcharge
+            if self.loads.surcharge > 0:
+                weight += self.loads.surcharge * width
+                
+            # Seismic forces
+            if self.loads.seismic_kh != 0 or self.loads.seismic_kv != 0:
+                weight_seismic = weight * (1 + self.loads.seismic_kv)
+                horizontal_seismic = weight * self.loads.seismic_kh
+            else:
+                weight_seismic = weight
+                horizontal_seismic = 0
+                
+            # Pore pressure
+            u = 0
+            if self.water.ru_coefficient is not None:
+                u = self.water.ru_coefficient * weight / width
+            elif self.water.phreatic_surface is not None:
+                water_level = self.get_water_level(x)
+                if y_base < water_level:
+                    hw = min(water_level - y_base, height)
+                    u = 9.81 * hw
+                    
+            # Base length
+            l = width / np.cos(alpha) if abs(np.cos(alpha)) > 1e-6 else width
+            
+            return {
+                'weight': weight,
+                'weight_seismic': weight_seismic,
+                'horizontal_seismic': horizontal_seismic,
+                'alpha': alpha,
+                'cohesion': c,
+                'phi': phi_rad,
+                'base_length': l,
+                'pore_pressure': u,
+                'width': width,
+                'height': height,
+                'x': x,
+                'y_base': y_base,
+                'y_top': y_top
+            }
+            
+        except Exception as e:
+            logger.warning(f"Error computing slice at x={x}: {str(e)}")
+            return None
+
+
+class StabilityAnalyzer:
+    """Main stability analysis engine."""
+    
+    def __init__(self, geometry: SlopeGeometry, layers: List[SoilLayer],
+                 water: WaterCondition = None, loads: LoadCondition = None):
+        self.geometry = geometry
+        self.layers = layers
+        self.water = water or WaterCondition()
+        self.loads = loads or LoadCondition()
+        self.slice_calc = SliceCalculator(geometry, layers, self.water, self.loads)
+        
+    def update_soil_layers(self, new_layers: List[SoilLayer]) -> None:
+        """Update soil layers without recreating the entire analyzer."""
+        self.layers = new_layers
+        self.slice_calc.layers = new_layers
+        
+    def analyze(self, method: AnalysisMethod = AnalysisMethod.BISHOP,
+                failure_mode: FailureMode = FailureMode.CIRCULAR,
+                num_slices: int = 50,
+                optimization_method: str = 'differential_evolution') -> AnalysisResult:
+        """Perform stability analysis."""
+        
+        if failure_mode != FailureMode.CIRCULAR:
+            raise NotImplementedError(f"{failure_mode.value} not yet implemented")
+            
+        # Find critical failure surface
+        if optimization_method == 'differential_evolution':
+            result = self._optimize_de(method, num_slices)
+        else:
+            result = self._optimize_gradient(method, num_slices)
+            
+        return result
+    
+    def _optimize_de(self, method: AnalysisMethod, num_slices: int) -> AnalysisResult:
+        """Optimize using differential evolution (global optimization)."""
+        
+        # Define search bounds
+        h = self.geometry.height
+        x_slope = h / np.tan(np.radians(self.geometry.angle))
+        
+        bounds = [
+            (-h, x_slope + h),  # x center
+            (h/2, 2*h),        # y center
+            (h/3, 2*h)         # radius
+        ]
+        
+        def objective(params):
+            center = (params[0], params[1])
+            radius = params[2]
+            fos = self._compute_fos(center, radius, method, num_slices)
+            return fos if fos > 0 else 1e6
+        
+        # Run optimization
+        result = differential_evolution(
+            objective, 
+            bounds,
+            maxiter=100,
+            popsize=15,
+            tol=0.001,
+            seed=42,
+            workers=-1  # Use all CPU cores
+        )
+        
+        # Get final FOS with more slices for accuracy
+        center = (result.x[0], result.x[1])
+        radius = result.x[2]
+        final_fos = self._compute_fos(center, radius, method, num_slices * 2)
+        
+        # Compute slice data for the critical surface
+        slice_data = self._get_slice_data(center, radius, method, num_slices)
+        
+        return AnalysisResult(
+            factor_of_safety=final_fos,
+            critical_center=center,
+            critical_radius=radius,
+            method=method,
+            failure_mode=FailureMode.CIRCULAR,
+            slice_data=slice_data,
+            iterations=result.nit
+        )
+    
+    def _compute_fos(self, center: Tuple[float, float], radius: float, 
+                     method: AnalysisMethod, num_slices: int) -> float:
+        """Compute Factor of Safety for given circle."""
+        
+        if method == AnalysisMethod.ORDINARY:
+            return self._compute_fos_ordinary(center, radius, num_slices)
+        elif method == AnalysisMethod.BISHOP:
+            return self._compute_fos_bishop(center, radius, num_slices)
+        elif method == AnalysisMethod.JANBU:
+            return self._compute_fos_janbu(center, radius, num_slices)
+        else:
+            raise NotImplementedError(f"{method.value} not yet implemented")
+    
+    def _iterate_slices(self, center: Tuple[float, float], radius: float, 
+                       num_slices: int, method: AnalysisMethod):
+        """Iterator for slice data to reduce code duplication."""
+        x_left = center[0] - radius
+        x_right = center[0] + radius
+        dx = (x_right - x_left) / num_slices
+        
+        for i in range(num_slices):
+            x = x_left + (i + 0.5) * dx
+            slice_data = self.slice_calc.compute_slice_forces(x, dx, center, radius, method)
+            if slice_data is not None:
+                yield slice_data
+    
+    def _compute_fos_ordinary(self, center: Tuple[float, float], radius: float, 
+                            num_slices: int) -> float:
+        """Ordinary Method of Slices (Fellenius)."""
+        try:
+            sum_driving = 0
+            sum_resisting = 0
+            
+            for slice_data in self._iterate_slices(center, radius, num_slices, AnalysisMethod.ORDINARY):
+                W = slice_data['weight_seismic']
+                alpha = slice_data['alpha']
+                c = slice_data['cohesion']
+                phi = slice_data['phi']
+                l = slice_data['base_length']
+                u = slice_data['pore_pressure']
+                
+                # Driving moment
+                sum_driving += W * np.sin(alpha) * radius
+                
+                # Resisting moment
+                N = W * np.cos(alpha) - u * l
+                sum_resisting += (c * l + N * np.tan(phi)) * radius
+                
+            if sum_driving == 0:
+                return np.inf
+                
+            return sum_resisting / sum_driving
+            
+        except (ValueError, ZeroDivisionError) as e:
+            logger.error(f"Numerical error in Ordinary method: {str(e)}")
+            return np.inf
+        except Exception as e:
+            logger.error(f"Unexpected error in Ordinary method: {str(e)}")
+            return np.inf
+    
+    def _compute_fos_bishop(self, center: Tuple[float, float], radius: float, 
+                           num_slices: int) -> float:
+        """Bishop's Simplified Method (iterative)."""
+        try:
+            # Initial FOS estimate
+            fos = 1.5
+            tolerance = 0.001
+            max_iterations = 50
+            
+            for iteration in range(max_iterations):
+                fos_old = fos
+                sum_moments = 0
+                sum_forces = 0
+                
+                for slice_data in self._iterate_slices(center, radius, num_slices, AnalysisMethod.BISHOP):
+                    W = slice_data['weight_seismic']
+                    alpha = slice_data['alpha']
+                    c = slice_data['cohesion']
+                    phi = slice_data['phi']
+                    b = slice_data['width']
+                    u = slice_data['pore_pressure']
+                    
+                    # Bishop's m_alpha term
+                    m_alpha = np.cos(alpha) + np.sin(alpha) * np.tan(phi) / fos_old
+                    
+                    if abs(m_alpha) < 1e-6:
+                        continue
+                        
+                    # Effective normal force
+                    N_prime = (W - u * b) / m_alpha
+                    
+                    # Resisting force
+                    sum_moments += (c * b + N_prime * np.tan(phi)) / m_alpha
+                    
+                    # Driving force
+                    sum_forces += W * np.sin(alpha)
+                    
+                if sum_forces == 0:
+                    return np.inf
+                    
+                fos = sum_moments / sum_forces
+                
+                # Check convergence
+                if abs(fos - fos_old) < tolerance:
+                    return fos
+                    
+            # Convergence warning with details
+            logger.warning(
+                f"Bishop's method did not converge after {max_iterations} iterations. "
+                f"Final FOS = {fos:.3f}, Last change = {abs(fos - fos_old):.6f}"
+            )
+            return fos
+            
+        except Exception as e:
+            logger.error(f"Error in Bishop's method: {str(e)}")
+            return np.inf
+    
+    def _compute_fos_janbu(self, center: Tuple[float, float], radius: float, 
+                          num_slices: int) -> float:
+        """Janbu's Simplified Method."""
+        try:
+            # Initial FOS estimate
+            fos = 1.5
+            tolerance = 0.001
+            max_iterations = 50
+            
+            # Correction factor f0 (function of depth ratio)
+            # For more accuracy, this could be calculated from published charts
+            # Here using typical range for circular surfaces
+            # Note: For a true circular surface, depth ratio calculation would 
+            # involve the actual slope geometry. This is simplified.
+            depth_ratio = 2 * radius / (2 * radius)  # Simplified for circular
+            if depth_ratio < 0.2:
+                f0 = 1.05
+            elif depth_ratio < 0.5:
+                f0 = 1.07
+            else:
+                f0 = 1.10
+            
+            for iteration in range(max_iterations):
+                fos_old = fos
+                sum_resisting = 0
+                sum_driving = 0
+                
+                for slice_data in self._iterate_slices(center, radius, num_slices, AnalysisMethod.JANBU):
+                    W = slice_data['weight_seismic']
+                    alpha = slice_data['alpha']
+                    c = slice_data['cohesion']
+                    phi = slice_data['phi']
+                    b = slice_data['width']
+                    u = slice_data['pore_pressure']
+                    
+                    # Janbu's m_alpha term - CORRECTED FORMULA
+                    cos_alpha = np.cos(alpha)
+                    if abs(cos_alpha) < 1e-6:
+                        continue
+                    
+                    m_alpha = cos_alpha**2 * (1 + np.tan(alpha) * np.tan(phi) / fos_old)
+                    
+                    if abs(m_alpha) < 1e-6:
+                        continue
+                        
+                    # Forces
+                    sum_resisting += (c * b + (W - u * b) * np.tan(phi)) / m_alpha
+                    sum_driving += W * np.tan(alpha)
+                    
+                if sum_driving == 0:
+                    return np.inf
+                    
+                fos = f0 * sum_resisting / sum_driving
+                
+                # Check convergence
+                if abs(fos - fos_old) < tolerance:
+                    return fos
+                    
+            # Convergence warning with details
+            logger.warning(
+                f"Janbu's method did not converge after {max_iterations} iterations. "
+                f"Final FOS = {fos:.3f}, Last change = {abs(fos - fos_old):.6f}"
+            )
+            return fos
+            
+        except Exception as e:
+            logger.error(f"Error in Janbu's method: {str(e)}")
+            return np.inf
+    
+    def _get_slice_data(self, center: Tuple[float, float], radius: float,
+                       method: AnalysisMethod, num_slices: int) -> Dict:
+        """Get detailed slice data for visualization."""
+        slice_info = list(self._iterate_slices(center, radius, num_slices, method))
+        
+        return {
+            'slices': slice_info,
+            'center': center,
+            'radius': radius
+        }
+    
+    def sensitivity_analysis(self, method: AnalysisMethod = AnalysisMethod.BISHOP,
+                           parameters: List[str] = None) -> Dict[str, List[float]]:
+        """Perform sensitivity analysis on key parameters."""
+        if parameters is None:
+            parameters = ['cohesion', 'friction_angle', 'unit_weight']
+            
+        base_result = self.analyze(method)
+        base_fos = base_result.factor_of_safety
+        
+        # Store original layers
+        original_layers = self.layers.copy()
+        
+        results = {}
+        variations = np.linspace(0.8, 1.2, 9)  # ±20% variation
+        
+        for param in parameters:
+            fos_values = []
+            
+            for factor in variations:
+                # Create modified layers using dataclasses.replace
+                modified_layers = []
+                for layer in original_layers:
+                    if hasattr(layer, param):
+                        current_value = getattr(layer, param)
+                        modified_layer = replace(layer, **{param: current_value * factor})
+                        modified_layers.append(modified_layer)
+                    else:
+                        modified_layers.append(layer)
+                
+                # Update layers and run analysis
+                self.update_soil_layers(modified_layers)
+                result = self.analyze(method)
+                fos_values.append(result.factor_of_safety)
+                
+            results[param] = {
+                'variations': (variations - 1) * 100,  # Convert to percentage
+                'fos_values': fos_values,
+                'sensitivity': (max(fos_values) - min(fos_values)) / base_fos
+            }
+        
+        # Restore original layers
+        self.update_soil_layers(original_layers)
+        
+        return results
+    
+    def probabilistic_analysis(self, method: AnalysisMethod = AnalysisMethod.BISHOP,
+                             num_simulations: int = 1000,
+                             parameter_stdev: Dict[str, float] = None) -> Dict:
+        """Monte Carlo probabilistic analysis."""
+        if parameter_stdev is None:
+            parameter_stdev = {
+                'cohesion': 0.1,  # 10% COV
+                'friction_angle': 0.05,  # 5% COV
+                'unit_weight': 0.05  # 5% COV
+            }
+        
+        # Store original layers
+        original_layers = self.layers.copy()
+        fos_results = []
+        
+        for _ in range(num_simulations):
+            # Create random layers using dataclasses.replace
+            random_layers = []
+            for layer in original_layers:
+                # Start with a copy of the layer
+                random_layer = layer
+                
+                # Apply random variations
+                for param, stdev in parameter_stdev.items():
+                    if hasattr(layer, param):
+                        mean_value = getattr(layer, param)
+                        random_value = np.random.normal(mean_value, mean_value * stdev)
+                        random_value = max(0.1, random_value)  # Ensure positive
+                        random_layer = replace(random_layer, **{param: random_value})
+                        
+                random_layers.append(random_layer)
+                
+            # Update layers and run analysis
+            self.update_soil_layers(random_layers)
+            result = self.analyze(method)
+            fos_results.append(result.factor_of_safety)
+        
+        # Restore original layers
+        self.update_soil_layers(original_layers)
+        
+        fos_array = np.array(fos_results)
+        
+        # Calculate reliability index (β)
+        mean_fos = np.mean(fos_array)
+        std_fos = np.std(fos_array)
+        reliability_index = (mean_fos - 1.0) / std_fos if std_fos > 0 else np.inf
+        
+        # Probability of failure
+        from scipy.stats import norm
+        pf = norm.cdf(-reliability_index)
+        
+        return {
+            'mean_fos': mean_fos,
+            'std_fos': std_fos,
+            'min_fos': np.min(fos_array),
+            'max_fos': np.max(fos_array),
+            'reliability_index': reliability_index,
+            'probability_of_failure': pf,
+            'fos_distribution': fos_array,
+            'percentiles': {
+                '5%': np.percentile(fos_array, 5),
+                '10%': np.percentile(fos_array, 10),
+                '50%': np.percentile(fos_array, 50),
+                '90%': np.percentile(fos_array, 90),
+                '95%': np.percentile(fos_array, 95)
+            }
+        }
+
+
+def validate_inputs(geometry: SlopeGeometry, layers: List[SoilLayer]) -> None:
+    """Validate input parameters."""
+    if geometry.height <= 0:
+        raise ValueError("Slope height must be positive")
+    if not 0 < geometry.angle < 90:
+        raise ValueError("Slope angle must be between 0 and 90 degrees")
+    if not layers:
+        raise ValueError("At least one soil layer must be defined")
+    
+    for i, layer in enumerate(layers):
+        if layer.thickness <= 0:
+            raise ValueError(f"Layer {i+1} thickness must be positive")
+        if layer.unit_weight <= 0:
+            raise ValueError(f"Layer {i+1} unit weight must be positive")
+        if layer.cohesion < 0:
+            raise ValueError(f"Layer {i+1} cohesion cannot be negative")
+        if not 0 <= layer.friction_angle <= 60:
+            warnings.warn(f"Layer {i+1} friction angle {layer.friction_angle}° is unusual")
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Example 1: Simple homogeneous slope
+    print("Example 1: Simple homogeneous slope")
+    print("-" * 50)
+    
+    geometry = SlopeGeometry(height=10, angle=30)
+    soil = SoilLayer(
+        name="Sandy Clay",
+        thickness=20,
+        unit_weight=18,
+        cohesion=15,
+        friction_angle=25
+    )
+    
+    analyzer = StabilityAnalyzer(geometry, [soil])
+    
+    # Run analysis with different methods
+    for method in [AnalysisMethod.ORDINARY, AnalysisMethod.BISHOP, AnalysisMethod.JANBU]:
+        result = analyzer.analyze(method=method)
+        print(f"{method.value}: FOS = {result.factor_of_safety:.3f}")
+    
+    # Example 2: Layered slope with water table
+    print("\nExample 2: Layered slope with groundwater")
+    print("-" * 50)
+    
+    layers = [
+        SoilLayer("Fill", thickness=3, unit_weight=18, cohesion=5, friction_angle=30),
+        SoilLayer("Clay", thickness=5, unit_weight=19, cohesion=25, friction_angle=15),
+        SoilLayer("Sand", thickness=12, unit_weight=20, cohesion=0, friction_angle=35)
+    ]
+    
+    water = WaterCondition(
+        phreatic_surface=[(0, 8), (15, 6), (30, 4)]
+    )
+    
+    analyzer2 = StabilityAnalyzer(geometry, layers, water=water)
+    result2 = analyzer2.analyze(method=AnalysisMethod.BISHOP)
+    print(f"Bishop's Method: FOS = {result2.factor_of_safety:.3f}")
+    print(f"Critical circle center: ({result2.critical_center[0]:.1f}, {result2.critical_center[1]:.1f})")
+    print(f"Critical radius: {result2.critical_radius:.1f} m")
+    
+    # Example 3: Seismic analysis
+    print("\nExample 3: Seismic loading")
+    print("-" * 50)
+    
+    loads = LoadCondition(surcharge=20, seismic_kh=0.15)
+    analyzer3 = StabilityAnalyzer(geometry, [soil], loads=loads)
+    result3 = analyzer3.analyze()
+    print(f"FOS with seismic loading: {result3.factor_of_safety:.3f}")
+    
+    # Example 4: Sensitivity analysis
+    print("\nExample 4: Sensitivity analysis")
+    print("-" * 50)
+    
+    sensitivity = analyzer.sensitivity_analysis()
+    for param, data in sensitivity.items():
+        print(f"{param}: sensitivity index = {data['sensitivity']:.3f}")
+    
+    # Example 5: Probabilistic analysis
+    print("\nExample 5: Probabilistic analysis (1000 simulations)")
+    print("-" * 50)
+    
+    prob_results = analyzer.probabilistic_analysis(num_simulations=1000)
+    print(f"Mean FOS: {prob_results['mean_fos']:.3f}")
+    print(f"Standard deviation: {prob_results['std_fos']:.3f}")
+    print(f"Reliability index (β): {prob_results['reliability_index']:.3f}")
+    print(f"Probability of failure: {prob_results['probability_of_failure']:.2e}")
+    print(f"5th percentile FOS: {prob_results['percentiles']['5%']:.3f}")
+    print(f"95th percentile FOS: {prob_results['percentiles']['95%']:.3f}")
